@@ -1,0 +1,264 @@
+diff -ru orig/vllm/models/step5/nvidia/flashinfer_sparse.py patches/vllm/models/step5/nvidia/flashinfer_sparse.py
+--- orig/vllm/models/step5/nvidia/flashinfer_sparse.py	2026-10-17 12:22:23.365038590 +0200
++++ patches/vllm/models/step5/nvidia/flashinfer_sparse.py	2026-10-17 12:22:45.060016853 +0200
+@@ -43,7 +43,12 @@
+         self._topk_backend = (
+             config.kernel_config.sparse_indexer_topk_backend if config else "auto"
+         )
+-        if torch.cuda.get_device_capability(device) == (9, 0):
++        # [SM120 port] FlashInfer's fp8_paged_mqa_logits targets SM100-class
++        # GPUs only. Every other arch (Hopper, SM120/SM121) uses the portable
++        # Triton kernel, which ignores FlashInfer's schedule metadata.
++        major = torch.cuda.get_device_capability(device)[0]
++        self._triton_logits = major != 10
++        if self._triton_logits:
+             from .ops.sparse_indexer_scores import paged_mqa_logits_sm90
+ 
+             self._logits = paged_mqa_logits_sm90
+@@ -169,8 +174,6 @@
+         context grows, and paired logits compile for ``next_n = 2``; either
+         would otherwise compile mid-serving on the first such prefill.
+         """
+-        from flashinfer.attn_scores import compute_paged_mqa_logits_schedule
+-
+         from .ops.prefill_indexer_metadata import prefill_indexer_chunk_size
+ 
+         rows = torch.arange(2, device=device)
+@@ -195,13 +198,20 @@
+                 context_lens=lengths,
+                 block_table=torch.arange(pages, dtype=torch.int32, device=device)[None],
+                 max_context_len=regions,
+-                schedule_meta=compute_paged_mqa_logits_schedule(lengths),
++                schedule_meta=self._schedule(lengths),
+             )
+ 
+-    def prefill_pair_inputs(self, indexer):
+-        """Per-chunk (context, table, schedule) of consecutive row pairs."""
++    def _schedule(self, lengths):
++        # [SM120 port] The Triton logits kernel takes no schedule; skip
++        # FlashInfer's schedule helper so nothing SM100-specific is JIT-built.
++        if self._triton_logits:
++            return None
+         from flashinfer.attn_scores import compute_paged_mqa_logits_schedule
+ 
++        return compute_paged_mqa_logits_schedule(lengths)
++
++    def prefill_pair_inputs(self, indexer):
++        """Per-chunk (context, table, schedule) of consecutive row pairs."""
+         pairs = []
+         for meta in indexer:
+             lengths = meta.lengths[1::2].contiguous()
+@@ -209,7 +219,7 @@
+                 (
+                     lengths,
+                     meta.block_table[::2].contiguous(),
+-                    compute_paged_mqa_logits_schedule(lengths),
++                    self._schedule(lengths),
+                 )
+             )
+         return pairs
+diff -ru orig/vllm/models/step5/nvidia/layernorm.py patches/vllm/models/step5/nvidia/layernorm.py
+--- orig/vllm/models/step5/nvidia/layernorm.py	2026-10-17 12:22:23.368115998 +0200
++++ patches/vllm/models/step5/nvidia/layernorm.py	2026-10-17 12:23:17.024015417 +0200
+@@ -2,12 +2,39 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Step5 normalization layers."""
+ 
++import os
+ from typing import Any
+ 
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+ 
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++# [SM120 port] The fused RMSNorm is a CuTe DSL kernel JIT-compiled for the
++# running GPU. If CuTe cannot target this arch, fall back to the PyTorch
++# implementation below (same FP32 math). STEP5_TORCH_RMSNORM=1 forces it.
++_CUTE_RMSNORM_OK = os.environ.get("STEP5_TORCH_RMSNORM", "0") != "1"
++
++
++def _try_cute(fn, *args, **kwargs):
++    global _CUTE_RMSNORM_OK
++    if not _CUTE_RMSNORM_OK:
++        return None
++    try:
++        return fn(*args, **kwargs)
++    except Exception as e:  # compile/launch failure on an unsupported arch
++        _CUTE_RMSNORM_OK = False
++        logger.warning(
++            "Step5 CuTe RMSNorm unavailable on this GPU (%s: %s); "
++            "using the PyTorch fallback.",
++            type(e).__name__,
++            e,
++        )
++        return None
++
+ _NORM_DTYPE_TO_TORCH_DTYPE = {
+     "bf16": torch.bfloat16,
+     "bfloat16": torch.bfloat16,
+@@ -51,7 +78,7 @@
+     out_dtype = out_dtype or x.dtype
+     if out is not None and (out.shape != x.shape or out.dtype != out_dtype):
+         raise ValueError("Step5 RMSNorm output buffer must match shape and dtype")
+-    if x.is_cuda:
++    if x.is_cuda and _CUTE_RMSNORM_OK:
+         from .ops.rms_norm import rms_norm, supports_rms_norm
+ 
+         if supports_rms_norm(x, weight) and (
+@@ -62,7 +89,8 @@
+                 and out.data_ptr() % 16 == 0
+             )
+         ):
+-            return rms_norm(
++            result = _try_cute(
++                rms_norm,
+                 x,
+                 weight,
+                 variance_epsilon,
+@@ -70,6 +98,8 @@
+                 weight_bias=float(zero_centered),
+                 out=out,
+             )
++            if result is not None:
++                return result
+     result = _step5_rms_norm(x, weight, variance_epsilon, zero_centered, out_dtype)
+     if out is None:
+         return result
+@@ -86,11 +116,12 @@
+     out_dtype: torch.dtype | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     out_dtype = out_dtype or x.dtype
+-    if x.is_cuda:
++    if x.is_cuda and _CUTE_RMSNORM_OK:
+         from .ops.rms_norm import rms_norm, supports_rms_norm
+ 
+         if supports_rms_norm(x, weight, residual):
+-            output = rms_norm(
++            output = _try_cute(
++                rms_norm,
+                 x,
+                 weight,
+                 variance_epsilon,
+@@ -98,7 +129,8 @@
+                 weight_bias=float(zero_centered),
+                 residual=residual,
+             )
+-            return output, residual
++            if output is not None:
++                return output, residual
+ 
+     residual_out = x + residual
+     output = _step5_rms_norm(
+diff -ru orig/vllm/models/step5/nvidia/ops/sparse_decode_attention.py patches/vllm/models/step5/nvidia/ops/sparse_decode_attention.py
+--- orig/vllm/models/step5/nvidia/ops/sparse_decode_attention.py	2026-10-17 12:22:23.377867691 +0200
++++ patches/vllm/models/step5/nvidia/ops/sparse_decode_attention.py	2026-10-17 12:23:02.184016084 +0200
+@@ -8,6 +8,9 @@
+ combine kernel merges splits and clears inactive rows.
+ """
+ 
++import functools
++import os
++
+ import torch
+ 
+ from vllm.platforms import current_platform
+@@ -18,6 +21,17 @@
+ _PDL = current_platform.is_arch_support_pdl()
+ 
+ 
++@functools.cache
++def _sm12x_stages(device_index: int) -> dict:
++    """[SM120 port] Each loop iteration gathers six 64x64 BF16 K/V tiles
++    (48 KB); Triton's default three stages need ~144 KB of shared memory,
++    above SM12x's ~99 KB per block. Use one stage there (env override).
++    Other archs keep Triton's default."""
++    if torch.cuda.get_device_capability(device_index)[0] != 12:
++        return {}
++    return {"num_stages": int(os.environ.get("STEP5_SM12X_DECODE_STAGES", "1"))}
++
++
+ @triton.jit(do_not_specialize=["SCALE"])
+ def _sparse_decode_split(
+     Q,
+@@ -333,6 +347,7 @@
+         _PDL,
+         num_warps=4,
+         launch_pdl=_PDL,
++        **_sm12x_stages(query.device.index),
+     )
+     if splits > 1:
+         _sparse_decode_combine[(rows, heads)](
+diff -ru orig/vllm/models/step5/nvidia/ops/sparse_indexer_scores.py patches/vllm/models/step5/nvidia/ops/sparse_indexer_scores.py
+--- orig/vllm/models/step5/nvidia/ops/sparse_indexer_scores.py	2026-10-17 12:22:23.371294562 +0200
++++ patches/vllm/models/step5/nvidia/ops/sparse_indexer_scores.py	2026-10-17 12:22:56.856016323 +0200
+@@ -2,6 +2,9 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """FP8 indexer scores directly from paged summary keys."""
+ 
++import functools
++import os
++
+ import torch
+ 
+ from vllm.triton_utils import tl, triton
+@@ -9,6 +12,19 @@
+ from .sparse_indexer import DecodeIndexerMetadata
+ 
+ 
++@functools.cache
++def _sm12x_stages(device_index: int) -> dict:
++    """[SM120 port] SM12x has ~99 KB shared memory per block (Hopper: 227 KB).
++
++    The decode scorer stages a 128x256 FP8 key tile per loop iteration; the
++    default three stages overflow SM12x, so use two there (env override).
++    Other archs keep Triton's default.
++    """
++    if torch.cuda.get_device_capability(device_index)[0] != 12:
++        return {}
++    return {"num_stages": int(os.environ.get("STEP5_SM12X_SCORE_STAGES", "2"))}
++
++
+ @triton.jit
+ def _direct_scores(
+     Q,
+@@ -182,6 +198,7 @@
+         query_len,
+         num_warps=4,
+         enable_fp_fusion=False,
++        **_sm12x_stages(query.device.index),
+     )
+     metadata = DecodeIndexerMetadata(
+         active, positions, current, lengths, block_table, topk_lengths
+diff -ru orig/vllm/models/step5/nvidia/sparse_attention.py patches/vllm/models/step5/nvidia/sparse_attention.py
+--- orig/vllm/models/step5/nvidia/sparse_attention.py	2026-10-17 12:22:23.362500027 +0200
++++ patches/vllm/models/step5/nvidia/sparse_attention.py	2026-10-17 12:22:32.836017402 +0200
+@@ -330,7 +330,7 @@
+             capability is None
+             or not Step5DSAAttentionBackend.supports_compute_capability(capability)
+         ):
+-            raise NotImplementedError("Step5 DSA requires SM90 or SM103")
++            raise NotImplementedError("Step5 DSA requires SM90, SM103 or SM12x")
+         if config is not None:
+             # FlashInfer builds host-side ragged plans before CUDA graph capture.
+             config.compilation_config.cudagraph_num_of_warmups = max(
+@@ -928,7 +928,15 @@
+ 
+     @classmethod
+     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
+-        return capability in (DeviceCapability(9, 0), DeviceCapability(10, 3))
++        # [SM120 port] RTX PRO 6000 / RTX 50 (12.0) and GB10 (12.1): the DSA
++        # path is Triton + FlashInfer FA2; the SM100-only FP8 indexer logits
++        # are swapped for the Triton (Hopper) kernel in flashinfer_sparse.py.
++        return capability in (
++            DeviceCapability(9, 0),
++            DeviceCapability(10, 3),
++            DeviceCapability(12, 0),
++            DeviceCapability(12, 1),
++        )
+ 
+     @staticmethod
+     def get_attention_warmup_num_tokens() -> int:

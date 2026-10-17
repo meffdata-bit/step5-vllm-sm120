@@ -1,0 +1,72 @@
+# stepfun-ai/Step-5-Preview-NVFP4 on 8x RTX PRO 6000 Blackwell (SM120, 96 GB, PCIe)
+# vLLM image vllm/vllm-openai:step-5-preview + the SM120 patches in ./patches
+#
+#   ./run_smoke.sh              # 1) validate kernels on one GPU (~2 min)
+#   docker compose up -d        # 2) serve
+#   docker compose logs -f
+#
+# The patched files are bind-mounted over the image's originals; nothing is rebuilt.
+# Run compose from this directory (mounts are relative).
+
+services:
+  step5:
+    image: vllm/vllm-openai:step-5-preview
+    container_name: step5-sm120
+    restart: unless-stopped
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ports:
+      - "8000:8000"
+    environment:
+      - HF_HUB_OFFLINE=1          # remove to let vLLM download the checkpoint
+      - CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      # Faster small all-reduces (decode) on dual-socket PCIe boxes; measured
+      # 25-30% lower latency for <=1 MB messages on our machine.
+      - NCCL_P2P_LEVEL=SYS
+      # Port knobs (defaults shown); only touch on Triton OutOfResources:
+      # - STEP5_SM12X_DECODE_STAGES=1
+      # - STEP5_SM12X_SCORE_STAGES=2
+      # - STEP5_TORCH_RMSNORM=1   # force the PyTorch RMSNorm fallback
+    volumes:
+      - ${MODELS_DIR:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
+      - ./patches/vllm/models/step5/nvidia/sparse_attention.py:/usr/local/lib/python3.12/dist-packages/vllm/models/step5/nvidia/sparse_attention.py:ro
+      - ./patches/vllm/models/step5/nvidia/flashinfer_sparse.py:/usr/local/lib/python3.12/dist-packages/vllm/models/step5/nvidia/flashinfer_sparse.py:ro
+      - ./patches/vllm/models/step5/nvidia/layernorm.py:/usr/local/lib/python3.12/dist-packages/vllm/models/step5/nvidia/layernorm.py:ro
+      - ./patches/vllm/models/step5/nvidia/ops/sparse_indexer_scores.py:/usr/local/lib/python3.12/dist-packages/vllm/models/step5/nvidia/ops/sparse_indexer_scores.py:ro
+      - ./patches/vllm/models/step5/nvidia/ops/sparse_decode_attention.py:/usr/local/lib/python3.12/dist-packages/vllm/models/step5/nvidia/ops/sparse_decode_attention.py:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    entrypoint: ["vllm", "serve"]
+    command:
+      - stepfun-ai/Step-5-Preview-NVFP4
+      - --host=0.0.0.0
+      - --port=8000
+      - --served-model-name=step5
+      - --tensor-parallel-size=8
+      - --distributed-executor-backend=mp
+      - --disable-custom-all-reduce
+      - --gpu-memory-utilization=0.93
+      - --max-model-len=1048576
+      - --max-num-batched-tokens=16384   # >= sparse_topk*8+17 for the DSA warmup
+      - --max-num-seqs=32
+      - --enable-prefix-caching
+      - --block-size=64                  # ~11% more KV cache than the default 16
+      - --spec-method=mtp
+      - --spec-tokens=3
+      - --reasoning-parser=step5
+      - --enable-auto-tool-choice
+      - --tool-call-parser=step5
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 3600s
